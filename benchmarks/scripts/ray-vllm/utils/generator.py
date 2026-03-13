@@ -1,4 +1,5 @@
 import os
+import sys
 import ray
 import math
 import json
@@ -32,6 +33,8 @@ class VllmWorker:
         max_model_len: Optional[int] = None,
         tensor_parallel_size: int = 1,
         enable_optimizations: bool = True,
+        use_flash_prefill: bool = False,
+        flash_prefill_root: Optional[str] = None,
         **kwargs
     ):
         """
@@ -45,6 +48,8 @@ class VllmWorker:
             max_model_len: Maximum model length
             tensor_parallel_size: Tensor parallel size (must match len(gpu_ids))
             enable_optimizations: Whether to enable chunked_prefill and prefix_caching
+            use_flash_prefill: Whether to enable FlashPrefill block-sparse attention
+            flash_prefill_root: Path to directory containing flash_prefill package
             **kwargs: Other vLLM parameters
         """
         self.worker_id = worker_id
@@ -53,10 +58,17 @@ class VllmWorker:
         # Set environment variable so current process only sees specified GPUs
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
         
+        if use_flash_prefill:
+            if flash_prefill_root and flash_prefill_root not in sys.path:
+                sys.path.insert(0, flash_prefill_root)
+            from flash_prefill.patches import patch_loader_vllm_0_13  # noqa: F401
+            enable_optimizations = False
+            print(f"  [Worker {worker_id}] FlashPrefill enabled, chunked_prefill & prefix_caching disabled")
+
         opt_status = "optimized" if enable_optimizations else "standard"
         gpu_str = ",".join(map(str, gpu_ids))
         print(f"  [Worker {worker_id}] Initializing ({opt_status})... (GPU {gpu_str}, TP={tensor_parallel_size})")
-        
+
         # Initialize vLLM
         vllm_kwargs = {
             "model": model_path,
@@ -548,12 +560,33 @@ class RayVllmGenerator(RayMixin, VllmMixin, Generator):
         # Check if any task in task_types requires disabling optimizations
         enable_optimizations = self._should_enable_optimizations()
         
+        # FlashPrefill: read from env var in the main process and pass explicitly to workers
+        use_flash_prefill = os.environ.get("USE_FLASH_PREFILL", "0") == "1"
+        flash_prefill_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+        ) if use_flash_prefill else None
+        if use_flash_prefill:
+            console.print(
+                f"  FlashPrefill ENABLED (root={flash_prefill_root})",
+                style=warning_style,
+            )
+
         # Create Ray remote class with dynamic GPU count and scheduling strategy
         # Use scheduling_strategy to place workers on specific nodes
         for i, (gpu_group, node_id) in enumerate(zip(self.worker_gpu_groups, self.worker_node_assignments)):
             # Create worker with node placement constraint
             VllmWorkerRemote = ray.remote(num_gpus=tensor_parallel_size)(VllmWorker)
             
+            worker_kwargs = dict(
+                worker_id=i,
+                model_path=model_path,
+                gpu_ids=gpu_group,
+                enable_optimizations=enable_optimizations,
+                use_flash_prefill=use_flash_prefill,
+                flash_prefill_root=flash_prefill_root,
+                **vllm_kwargs,
+            )
+
             # If we have node assignment, use scheduling strategy
             if node_id is not None:
                 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -563,22 +596,10 @@ class RayVllmGenerator(RayMixin, VllmMixin, Generator):
                 )
                 worker = VllmWorkerRemote.options(
                     scheduling_strategy=scheduling_strategy
-                ).remote(
-                    worker_id=i,
-                    model_path=model_path,
-                    gpu_ids=gpu_group,
-                    enable_optimizations=enable_optimizations,
-                    **vllm_kwargs
-                )
+                ).remote(**worker_kwargs)
             else:
                 # No node constraint, let Ray decide
-                worker = VllmWorkerRemote.remote(
-                    worker_id=i,
-                    model_path=model_path,
-                    gpu_ids=gpu_group,
-                    enable_optimizations=enable_optimizations,
-                    **vllm_kwargs
-                )
+                worker = VllmWorkerRemote.remote(**worker_kwargs)
             self.workers.append(worker)
         
         # Wait for all Workers to initialize

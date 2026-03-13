@@ -28,7 +28,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # ============================================================================
 export BASE_MODEL=${BASE_MODEL:-"/path/to/your/model"}
 export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
-export VLLM_ATTENTION_BACKEND=XFORMERS
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+
+# FlashPrefill: set to 1 to enable block-sparse prefill acceleration
+export USE_FLASH_PREFILL=${USE_FLASH_PREFILL:-0}
 
 # ============================================================================
 # Training Hyperparameters

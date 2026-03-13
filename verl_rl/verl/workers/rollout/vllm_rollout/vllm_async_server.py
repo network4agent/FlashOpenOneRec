@@ -256,8 +256,8 @@ class AsyncvLLMServer(AsyncServerBase):
             load_format="auto",
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            enable_chunked_prefill=False if os.environ.get("USE_FLASH_PREFILL", "0") == "1" else config.enable_chunked_prefill,
+            enable_prefix_caching=False if os.environ.get("USE_FLASH_PREFILL", "0") == "1" else True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
         )

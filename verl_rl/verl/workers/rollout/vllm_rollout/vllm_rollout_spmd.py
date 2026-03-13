@@ -50,6 +50,13 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.worker.worker_base import WorkerWrapperBase
 
+if os.environ.get("USE_FLASH_PREFILL", "0") == "1":
+    import sys
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+    from flash_prefill.patches import patch_loader_vllm_0_13  # noqa: F401
+
 from verl import DataProto
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
@@ -162,6 +169,10 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
+        use_flash_prefill = os.environ.get("USE_FLASH_PREFILL", "0") == "1"
+        _enable_chunked_prefill = False if use_flash_prefill else config.enable_chunked_prefill
+        _enable_prefix_caching = False if use_flash_prefill else True
+
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -176,8 +187,8 @@ class vLLMRollout(BaseRollout):
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            enable_chunked_prefill=_enable_chunked_prefill,
+            enable_prefix_caching=_enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
             **lora_kwargs,

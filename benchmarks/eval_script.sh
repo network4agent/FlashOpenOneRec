@@ -7,6 +7,13 @@ BASE_OUTPUT_DIR="${BENCHMARK_BASE_DIR}/results/${VERSION}/results_${2}"
 BASE_LOG_NAME="${BENCHMARK_BASE_DIR}/auto_eval_logs/${VERSION}/$2"
 ENABLE_THINKING=$3
 
+# FlashPrefill: set to 1 to enable block-sparse prefill acceleration
+export USE_FLASH_PREFILL="${USE_FLASH_PREFILL:-0}"
+if [ "$USE_FLASH_PREFILL" = "1" ]; then
+    export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+    echo "FlashPrefill ENABLED (VLLM_ATTENTION_BACKEND=FLASH_ATTN)"
+fi
+
 # Read configuration from environment variables (set by eval_script.py)
 # Fallback to hardcoded paths if not set
 BENCHMARK_BASE_DIR="${BENCHMARK_BASE_DIR:-/home/user/benchmark}"
