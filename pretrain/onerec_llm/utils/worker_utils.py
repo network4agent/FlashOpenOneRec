@@ -4,6 +4,18 @@ import os
 import torch
 import torch.distributed as dist
 
+_dp_group = None
+
+
+def set_dp_group(group):
+    """Set the data-parallel process group used by pytorch_worker_info.
+    
+    When TP+FSDP is active, data loading must shard files across DP ranks
+    (not global ranks) so that all TP ranks in a DP group read the same data.
+    """
+    global _dp_group
+    _dp_group = group
+
 
 def get_worker_info():
     """Get PyTorch DataLoader worker information.
@@ -36,6 +48,10 @@ def get_worker_info():
 def pytorch_worker_info(group=None):
     """Return node and worker info for PyTorch and some distributed environments.
 
+    When ``set_dp_group`` has been called (TP+FSDP), the returned rank and
+    world_size correspond to the data-parallel group so that TP ranks sharing
+    the same DP group read identical data.
+
     Args:
         group: Optional process group for distributed environments. Defaults to None.
 
@@ -49,19 +65,20 @@ def pytorch_worker_info(group=None):
     rank = 0
     world_size = 1
     
-    # Check environment variables first
+    # Try to get from PyTorch distributed (preferred: respects DP group)
+    try:
+        if dist.is_available() and dist.is_initialized():
+            effective_group = group or _dp_group or dist.group.WORLD
+            rank = dist.get_rank(group=effective_group)
+            world_size = dist.get_world_size(group=effective_group)
+            return rank, world_size, worker, num_workers
+    except (ModuleNotFoundError, AttributeError):
+        pass
+    
+    # Fallback to environment variables
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-    else:
-        # Try to get from PyTorch distributed
-        try:
-            if dist.is_available() and dist.is_initialized():
-                group = group or dist.group.WORLD
-                rank = dist.get_rank(group=group)
-                world_size = dist.get_world_size(group=group)
-        except (ModuleNotFoundError, AttributeError):
-            pass
 
     return rank, world_size, worker, num_workers
 

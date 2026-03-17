@@ -72,12 +72,16 @@ class EmbeddingGradientMasker:
         config: Model config with vocab_size attribute
         start_optimize_embedding_index: Index from which to start optimizing embeddings.
             Tokens before this index will be frozen. If <= 0, no masking is applied.
+        dp_group: Data-parallel process group. When TP is active, embeddings are
+            FSDP-sharded only across DP ranks, so shard boundaries must use DP
+            world_size/rank instead of global values.
     """
     
-    def __init__(self, model, config, start_optimize_embedding_index):
+    def __init__(self, model, config, start_optimize_embedding_index, dp_group=None):
         self.model = model
         self.config = config
         self.start_optimize_embedding_index = start_optimize_embedding_index
+        self.dp_group = dp_group
         self.embedding_params = []  # List of (name, param) tuples for embedding layers
         self.saved_weights = {}  # Dict mapping param name -> frozen weight slice (torch.Tensor)
 
@@ -98,8 +102,8 @@ class EmbeddingGradientMasker:
         This method calculates which portion of the local shard needs to be frozen
         and saves those weights for later restoration after optimizer steps.
         """
-        dp_world_size = dist.get_world_size()
-        dp_rank = dist.get_rank()
+        dp_world_size = dist.get_world_size(group=self.dp_group)
+        dp_rank = dist.get_rank(group=self.dp_group)
         full_vocab_size = self.config.vocab_size
         
         # Calculate shard boundaries: each rank owns a contiguous slice of the vocabulary

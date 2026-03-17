@@ -1,4 +1,4 @@
-"""Distributed training utilities for FSDP model sharding and checkpoint loading."""
+"""Distributed training utilities for FSDP/TP model sharding and checkpoint loading."""
 
 from typing import Any, Dict, Optional
 
@@ -11,6 +11,44 @@ from onerec_llm.utils.distributed import get_world_size_and_rank
 from torch.distributed._composable.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    RowwiseParallel,
+    parallelize_module,
+)
+
+def apply_tp(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+    model_class: str = 'Qwen3ForCausalLM',
+) -> None:
+    """Apply Tensor Parallelism to transformer decoder layers.
+    
+    Parallelizes attention projections and MLP layers following the Megatron-style
+    column/row split: column-parallel on the first linear (q/k/v/gate/up) and
+    row-parallel on the second (o/down).
+    
+    Args:
+        model: Model to parallelize.
+        tp_mesh: Device mesh for the TP dimension.
+        model_class: Model class name.
+    """
+    tp_plan = {
+        "self_attn.q_proj": ColwiseParallel(),
+        "self_attn.k_proj": ColwiseParallel(),
+        "self_attn.v_proj": ColwiseParallel(),
+        "self_attn.o_proj": RowwiseParallel(),
+        "mlp.gate_proj": ColwiseParallel(),
+        "mlp.up_proj": ColwiseParallel(),
+        "mlp.down_proj": RowwiseParallel(),
+    }
+
+    if model_class == 'Qwen3ForCausalLM':
+        for layer in model.model.layers:
+            parallelize_module(layer, tp_mesh, tp_plan)
+    else:
+        raise ValueError(f"Unsupported model_class for TP: {model_class}")
+
 
 def shard_model(
     model: nn.Module,
@@ -131,7 +169,8 @@ def load_from_full_model_state_dict(
             )
         
         mesh = sharded_meta_param.device_mesh
-        dist.broadcast(full_tensor, src=0, group=mesh.get_group(0))
+        # Use WORLD group for broadcast so all ranks (across both TP and DP dims) receive the full tensor
+        dist.broadcast(full_tensor, src=0)
         dist.barrier()
         
         sharded_tensor = distribute_tensor(

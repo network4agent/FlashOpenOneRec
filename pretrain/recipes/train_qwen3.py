@@ -46,6 +46,7 @@ from onerec_llm.training.gradients import (
     compute_fsdp_zero2_grad_norm,
 )
 from onerec_llm.training.distributed import (
+    apply_tp,
     load_from_full_model_state_dict,
     shard_model,
 )
@@ -61,6 +62,7 @@ from onerec_llm.utils.common import (
 from onerec_llm.utils.ds_utils import format_dict_or_list, print_input_info
 from onerec_llm.utils.mfu_stats import MFUStats
 from onerec_llm.utils.time_tracker import TimeTracker
+from onerec_llm.utils.worker_utils import set_dp_group
 
 # Disable garbage collection for performance
 gc.disable()
@@ -284,6 +286,10 @@ def get_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_chunked_loss_computer", action="store_true",
                        help="Use chunked loss computer")
     
+    # Parallelism arguments
+    parser.add_argument("--tp_size", type=int, default=1,
+                       help="Tensor parallel degree (must divide world_size and num_attention_heads)")
+
     # Profiling arguments
     parser.add_argument("--enable_profiler", action="store_true",
                        help="Enable PyTorch profiler for performance analysis")
@@ -418,12 +424,19 @@ def save_model_checkpoint(
 def initialize_distributed() -> Tuple[int, int, int]:
     """Initialize distributed training environment.
     
+    Supports both OpenMPI (OMPI_*) and torchrun (RANK/WORLD_SIZE/LOCAL_RANK) env vars.
+    
     Returns:
         Tuple of (rank, world_size, local_rank)
     """
-    rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", 0))
-    world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", 0))
-    local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", 0))
+    if "OMPI_COMM_WORLD_RANK" in os.environ:
+        rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+        world_size = int(os.environ["OMPI_COMM_WORLD_SIZE"])
+        local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
+    else:
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
     
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(
@@ -437,17 +450,19 @@ def initialize_distributed() -> Tuple[int, int, int]:
 
 def initialize_model(
     args,
-    device_mesh: DeviceMesh,
+    dp_mesh: DeviceMesh,
     state_dict: Optional[Dict[str, torch.Tensor]],
     converter: StateDictConverter,
+    tp_mesh: Optional[DeviceMesh] = None,
 ) -> torch.nn.Module:
-    """Initialize and shard model.
+    """Initialize and shard model with optional TP + FSDP.
     
     Args:
         args: Training arguments
-        device_mesh: Device mesh for distributed training
+        dp_mesh: Device mesh for FSDP (data parallel dimension)
         state_dict: Optional pretrained state dict
         converter: State dict converter
+        tp_mesh: Optional device mesh for tensor parallelism
     
     Returns:
         Initialized and sharded model
@@ -475,12 +490,17 @@ def initialize_model(
     if args.use_fp32_weight:
         model = model.float()
     
-    # Shard model with FSDP
+    # Apply Tensor Parallelism before FSDP
+    if tp_mesh is not None and tp_mesh.size() > 1:
+        print_rank_0(f"Applying Tensor Parallelism with tp_size={tp_mesh.size()}")
+        apply_tp(model, tp_mesh, model_class=args.model_class)
+    
+    # Shard model with FSDP on the DP mesh
     shard_model(
         model=model,
         cpu_offload=False,
         reshard_after_forward=args.reshard_after_forward,
-        dp_mesh=device_mesh,
+        dp_mesh=dp_mesh,
         fp32_weight=args.use_fp32_weight,
         model_class=args.model_class,
         fp32_reduce=args.use_fp32_reduce
@@ -753,6 +773,8 @@ def compute_metrics(
     loss_fn: CrossEntropyLoss,
     args,
     metrics: TrainingMetrics,
+    dp_group=None,
+    dp_world_size: int = 1,
 ) -> Tuple[float, float, float, int, int, int]:
     """Compute and accumulate training metrics.
     
@@ -764,6 +786,8 @@ def compute_metrics(
         loss_fn: Loss function instance
         args: Training arguments
         metrics: Training metrics tracker
+        dp_group: Data-parallel process group (None = WORLD)
+        dp_world_size: Number of data-parallel ranks
     
     Returns:
         Tuple of (avg_loss, avg_itemic_token_loss, avg_text_token_loss,
@@ -783,12 +807,12 @@ def compute_metrics(
     # Works for both 1D (flattened) and 2D (batch, seq_len) loss_mask
     num_valid_tokens = (loss_mask == 1).sum().item()
     
-    # Aggregate metrics across all ranks
+    # Aggregate metrics across DP ranks only (TP ranks hold duplicate data)
     token_metrics = torch.tensor(
         [token_count, num_samples, num_valid_tokens]
     ).cuda(non_blocking=True)
     dist.all_reduce(
-        token_metrics, op=dist.ReduceOp.SUM, group=None
+        token_metrics, op=dist.ReduceOp.SUM, group=dp_group
     )
     num_tokens, num_samples, num_valid_tokens = (
         token_metrics.detach().cpu().numpy()
@@ -800,8 +824,8 @@ def compute_metrics(
     
     # Compute average loss for this step
     avg_loss = loss.detach()
-    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-    avg_loss = avg_loss.item() / dist.get_world_size()
+    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM, group=dp_group)
+    avg_loss = avg_loss.item() / dp_world_size
     metrics.period_sum_loss += avg_loss
     
     # Compute itemic and text token losses
@@ -809,10 +833,10 @@ def compute_metrics(
         itemic_id_mask = itemic_id_mask.view(per_token_loss.shape)
         avg_itemic_token_loss = (itemic_id_mask * per_token_loss).sum() / (itemic_id_mask.sum() + 1e-6)
         avg_text_token_loss = ((1 - itemic_id_mask) * per_token_loss).sum() / ((1 - itemic_id_mask).sum() + 1e-6)
-        dist.all_reduce(avg_itemic_token_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(avg_text_token_loss, op=dist.ReduceOp.SUM)
-        avg_itemic_token_loss = avg_itemic_token_loss.item() / dist.get_world_size()
-        avg_text_token_loss = avg_text_token_loss.item() / dist.get_world_size()
+        dist.all_reduce(avg_itemic_token_loss, op=dist.ReduceOp.SUM, group=dp_group)
+        dist.all_reduce(avg_text_token_loss, op=dist.ReduceOp.SUM, group=dp_group)
+        avg_itemic_token_loss = avg_itemic_token_loss.item() / dp_world_size
+        avg_text_token_loss = avg_text_token_loss.item() / dp_world_size
     else:
         avg_itemic_token_loss = 0.0
         avg_text_token_loss = avg_loss
@@ -860,6 +884,8 @@ def log_training_step(
     epoch_idx: int,
     tb_logger: TensorBoardLogger,
     chunked_loss_computer: Optional[ChunkedLossComputer],
+    dp_group=None,
+    dp_world_size: int = 1,
 ) -> float:
     """Log training step metrics.
     
@@ -877,6 +903,8 @@ def log_training_step(
         epoch_idx: Current epoch index
         tb_logger: TensorBoard logger
         chunked_loss_computer: Optional chunked loss computer
+        dp_group: Data-parallel process group (None = WORLD)
+        dp_world_size: Number of data-parallel ranks
     
     Returns:
         Updated period_start_time for next logging period
@@ -893,32 +921,32 @@ def log_training_step(
     # These metrics show recent performance and can fluctuate with short-term variations
     sec_per_step = period_duration / period_num_steps
     tokens_per_sec_per_gpu_current = (
-        metrics.period_num_tokens / period_duration / dist.get_world_size()
+        metrics.period_num_tokens / period_duration / dp_world_size
     )
     samples_per_sec_per_gpu_current = (
-        metrics.period_num_samples / period_duration / dist.get_world_size()
+        metrics.period_num_samples / period_duration / dp_world_size
     )
     samples_per_step_per_gpu_current = (
-        metrics.period_num_samples / period_num_steps / dist.get_world_size()
+        metrics.period_num_samples / period_num_steps / dp_world_size
     )
     valid_tokens_per_sec_per_gpu_current = (
-        metrics.period_num_valid_tokens / period_duration / dist.get_world_size()
+        metrics.period_num_valid_tokens / period_duration / dp_world_size
     )
     
     # Average metrics (_avg): reflect average performance over entire training
     # These metrics smooth out short-term fluctuations and include all overhead
     # (checkpoint saving, logging, etc.), providing a more stable view of overall performance
     samples_per_step_per_gpu_avg = (
-        metrics.total_num_samples / dist.get_world_size() / max(global_step, 1)
+        metrics.total_num_samples / dp_world_size / max(global_step, 1)
     )
     samples_per_sec_per_gpu_avg = (
-        metrics.total_num_samples / dist.get_world_size() / (end_time - training_start_time)
+        metrics.total_num_samples / dp_world_size / (end_time - training_start_time)
     )
     tokens_per_step_per_gpu_avg = (
-        metrics.total_num_tokens / dist.get_world_size() / max(global_step, 1)
+        metrics.total_num_tokens / dp_world_size / max(global_step, 1)
     )
     tokens_per_sec_per_gpu_avg = (
-        metrics.total_num_tokens / dist.get_world_size() / (end_time - training_start_time)
+        metrics.total_num_tokens / dp_world_size / (end_time - training_start_time)
     )
     
     # Compute average losses over the logging period
@@ -926,12 +954,12 @@ def log_training_step(
     avg_itemic_token_loss = metrics.period_sum_itemic_token_loss / period_num_steps
     avg_text_token_loss = metrics.period_sum_text_token_loss / period_num_steps
     
-    # Reduce data source metrics across all ranks
-    period_data_source_loss = dist_reduce_dict(metrics.period_data_source_loss)
-    period_data_source_tokens = dist_reduce_dict(metrics.period_data_source_tokens)
-    period_valid_data_source_tokens = dist_reduce_dict(metrics.period_valid_data_source_tokens)
+    # Reduce data source metrics across DP ranks
+    period_data_source_loss = dist_reduce_dict(metrics.period_data_source_loss, group=dp_group)
+    period_data_source_tokens = dist_reduce_dict(metrics.period_data_source_tokens, group=dp_group)
+    period_valid_data_source_tokens = dist_reduce_dict(metrics.period_valid_data_source_tokens, group=dp_group)
     total_data_source_samples = dist_reduce_dict(
-        metrics.local_period_data_source_samples, group=None
+        metrics.local_period_data_source_samples, group=dp_group
     )
     # Update total data source tokens
     for ds_key, ds_num_tokens in period_data_source_tokens.items():
@@ -949,7 +977,7 @@ def log_training_step(
         "perf/samples_per_sec_per_gpu_current": samples_per_sec_per_gpu_current,
         "perf/total_num_tokens": metrics.total_num_tokens,
         "perf/total_num_samples": metrics.total_num_samples,
-        "perf/num_sample_per_gpu": metrics.total_num_samples / dist.get_world_size(),
+        "perf/num_sample_per_gpu": metrics.total_num_samples / dp_world_size,
         "perf/samples_per_step_per_gpu_current": samples_per_step_per_gpu_current,
         # Note: num_sample_per_sec_per_gpu is the same as samples_per_sec_per_gpu_current
         # Keeping for backward compatibility, but samples_per_sec_per_gpu_current should be used
@@ -1010,7 +1038,28 @@ def train():
     
     # Initialize distributed training
     rank, world_size, local_rank = initialize_distributed()
-    device_mesh = init_device_mesh("cuda", mesh_shape=(dist.get_world_size(),))
+    
+    tp_size = args.tp_size
+    dp_size = world_size // tp_size
+    assert world_size % tp_size == 0, f"world_size ({world_size}) must be divisible by tp_size ({tp_size})"
+    
+    if tp_size > 1:
+        device_mesh = init_device_mesh(
+            "cuda", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp")
+        )
+        tp_mesh = device_mesh["tp"]
+        dp_mesh = device_mesh["dp"]
+    else:
+        device_mesh = init_device_mesh("cuda", mesh_shape=(world_size,))
+        tp_mesh = None
+        dp_mesh = device_mesh
+    
+    dp_group = dp_mesh.get_group() if tp_size > 1 else None
+    dp_world_size = dp_size
+    
+    # Set DP group for data loading so TP ranks in same group read same data
+    if dp_group is not None:
+        set_dp_group(dp_group)
     
     set_random_seed(args.seed)
     
@@ -1051,7 +1100,7 @@ def train():
         tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "log"))
     
     # Initialize model
-    model = initialize_model(args, device_mesh, state_dict, converter)
+    model = initialize_model(args, dp_mesh, state_dict, converter, tp_mesh=tp_mesh)
     if state_dict is not None:
         del state_dict
     
@@ -1070,7 +1119,8 @@ def train():
     # This allows selective training of embeddings based on token index
     # Useful for fine-tuning where only certain token embeddings should be updated
     embedding_masker = EmbeddingGradientMasker(
-        model, model.config, args.start_optimize_embedding_index
+        model, model.config, args.start_optimize_embedding_index,
+        dp_group=dp_group,
     )
     if args.start_optimize_embedding_index > 0:
         # Save frozen embedding parameters to restore after optimizer step
@@ -1202,7 +1252,8 @@ def train():
             # Compute metrics
             epoch_idx = batch.get("epoch_idx", torch.tensor([0])).cpu().item()
             avg_loss, avg_itemic_token_loss, avg_text_token_loss, num_tokens, num_samples, num_valid_tokens = compute_metrics(
-                batch, loss, per_token_loss, batch["loss_mask"], loss_fn, args, metrics
+                batch, loss, per_token_loss, batch["loss_mask"], loss_fn, args, metrics,
+                dp_group=dp_group, dp_world_size=dp_world_size,
             )
             
             step_time_tracker.tick("compute_metrics")
@@ -1228,7 +1279,8 @@ def train():
                     global_step, metrics, args, lr_scheduler, grad_norm,
                     period_start_time, training_start_time, mfu_stats, 
                     step_time_tracker, iteration_time_tracker,
-                    epoch_idx, tb_logger, chunked_loss_computer
+                    epoch_idx, tb_logger, chunked_loss_computer,
+                    dp_group=dp_group, dp_world_size=dp_world_size,
                 )
                 metrics.reset_period_accumulators()
             
